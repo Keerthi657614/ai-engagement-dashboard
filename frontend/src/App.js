@@ -46,7 +46,7 @@ function App() {
     navigator.mediaDevices.getUserMedia({ video: true })
       .then(stream => { if (videoRef.current) videoRef.current.srcObject = stream; });
 
-    const ws = new WebSocket("ws://localhost:8000/ws");
+    const ws = new WebSocket("wss://ai-engagement-dashboard.onrender.com/ws");
     ws.onopen = () => setConnected(true);
     ws.onclose = () => setConnected(false);
     ws.onmessage = (event) => {
