@@ -1,3 +1,4 @@
+'''
 import streamlit as st
 import cv2
 import mediapipe as mp
@@ -254,3 +255,163 @@ if run:
         time.sleep(0.02)
 
     cap.release()
+    '''
+import streamlit as st
+import cv2
+import mediapipe as mp
+import numpy as np
+import torch
+from torchvision import models, transforms
+from collections import deque
+import pandas as pd
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+import av
+
+# =====================================================
+# CONFIG
+# =====================================================
+st.set_page_config(page_title="Engagement Monitor", layout="wide")
+
+DEVICE = "cpu"
+
+EAR_THRESHOLD = 0.22
+GAZE_CENTER_TOL = 0.10
+HEAD_YAW_TOL = 10
+YAWN_THRESHOLD = 0.45
+BUFFER_SIZE = 5
+
+# =====================================================
+# LOAD MODEL
+# =====================================================
+@st.cache_resource
+def load_model():
+    model = models.resnet50(weights=None)
+    model.fc = torch.nn.Linear(model.fc.in_features, 7)
+    model.load_state_dict(torch.load("models/best_model.pth", map_location=DEVICE))
+    model.eval()
+    return model
+
+model = load_model()
+
+# =====================================================
+# MEDIAPIPE
+# =====================================================
+mp_face_mesh = mp.solutions.face_mesh
+
+LEFT_EYE = [33,160,158,133,153,144]
+RIGHT_EYE = [362,385,387,263,373,380]
+MOUTH_VERT = (13,14)
+MOUTH_HORZ = (78,308)
+HEAD_POSE_POINTS = [1,33,61,199,263,291]
+
+# =====================================================
+# UTILS
+# =====================================================
+def dist(p1,p2):
+    return np.linalg.norm(np.array(p1)-np.array(p2))
+
+def compute_EAR(landmarks, idx, w, h):
+    pts=[(int(landmarks[i].x*w),int(landmarks[i].y*h)) for i in idx]
+    return (dist(pts[1],pts[5])+dist(pts[2],pts[4]))/(2*dist(pts[0],pts[3])+1e-6)
+
+def mouth_ratio(landmarks,w,h):
+    top=(int(landmarks[MOUTH_VERT[0]].x*w),int(landmarks[MOUTH_VERT[0]].y*h))
+    bot=(int(landmarks[MOUTH_VERT[1]].x*w),int(landmarks[MOUTH_VERT[1]].y*h))
+    left=(int(landmarks[MOUTH_HORZ[0]].x*w),int(landmarks[MOUTH_HORZ[0]].y*h))
+    right=(int(landmarks[MOUTH_HORZ[1]].x*w),int(landmarks[MOUTH_HORZ[1]].y*h))
+    return dist(top,bot)/(dist(left,right)+1e-6)
+
+# =====================================================
+# SESSION STATE BUFFERS
+# =====================================================
+if "ear_buffer" not in st.session_state:
+    st.session_state.ear_buffer = deque(maxlen=BUFFER_SIZE)
+    st.session_state.engagement_buffer = deque(maxlen=10)
+    st.session_state.analytics = {"Focused":0,"Bored":0,"Looking Away":0,"Drowsy":0}
+    st.session_state.graph_data = deque(maxlen=200)
+    st.session_state.drowsy_counter = 0
+
+# =====================================================
+# VIDEO PROCESSOR
+# =====================================================
+class EngagementProcessor(VideoProcessorBase):
+
+    def __init__(self):
+        self.face_mesh = mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            refine_landmarks=True,
+            max_num_faces=1
+        )
+
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        h,w = img.shape[:2]
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb)
+
+        state = "No Face"
+        engagement = 0.0
+
+        if results.multi_face_landmarks:
+            landmarks = results.multi_face_landmarks[0].landmark
+
+            EAR = (compute_EAR(landmarks, LEFT_EYE, w, h) +
+                   compute_EAR(landmarks, RIGHT_EYE, w, h)) / 2
+
+            st.session_state.ear_buffer.append(EAR)
+            avg_ear = np.mean(st.session_state.ear_buffer)
+
+            eye_score = 1 if avg_ear > EAR_THRESHOLD else 0
+            engagement = eye_score
+
+            st.session_state.engagement_buffer.append(engagement)
+            engagement = np.mean(st.session_state.engagement_buffer)
+
+            if avg_ear < 0.18:
+                st.session_state.drowsy_counter += 1
+            else:
+                st.session_state.drowsy_counter = 0
+
+            if st.session_state.drowsy_counter > 8:
+                state = "Drowsy"
+            elif engagement > 0.75:
+                state = "Focused"
+            else:
+                state = "Bored"
+
+            st.session_state.analytics[state] += 1
+
+        st.session_state.graph_data.append(engagement)
+
+        cv2.putText(img,f"State: {state}",(20,40),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.9,(0,255,0),3)
+
+        cv2.putText(img,f"Engagement:{engagement:.2f}",(20,75),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,255),2)
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+# =====================================================
+# UI
+# =====================================================
+st.title("🎯 Real-Time Engagement Monitor")
+
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
+
+webrtc_streamer(
+    key="engagement",
+    video_processor_factory=EngagementProcessor,
+    rtc_configuration=RTC_CONFIGURATION
+)
+
+total = sum(st.session_state.analytics.values()) + 1e-6
+c1,c2,c3,c4 = st.columns(4)
+
+c1.metric("Focused %", f"{st.session_state.analytics['Focused']/total*100:.1f}")
+c2.metric("Bored %", f"{st.session_state.analytics['Bored']/total*100:.1f}")
+c3.metric("Away %", f"{st.session_state.analytics['Looking Away']/total*100:.1f}")
+c4.metric("Drowsy %", f"{st.session_state.analytics['Drowsy']/total*100:.1f}")
+
+st.line_chart(pd.DataFrame({"Engagement":list(st.session_state.graph_data)}))
